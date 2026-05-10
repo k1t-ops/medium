@@ -1,9 +1,20 @@
 use home_node::config::load_from_path;
 use home_node::control::build_registration;
 use medium_cli::run_main;
+use rcgen::{CertificateParams, KeyPair};
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+
+const LEGACY_SSH_CA_PARAM: &str =
+    "&ssh_ca_public_key=ssh-ed25519%20AAAAC3NzaC1lZDI1NTE5AAAAITestMediumSshCa%20medium-ssh-ca";
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -118,6 +129,7 @@ async fn init_control_creates_expected_paths_and_files() -> anyhow::Result<()> {
     assert!(output.contains("&shared_secret="));
     assert!(!output.contains("&service_ca_cert="));
     assert!(!output.contains("&service_ca_key="));
+    assert!(!output.contains("&ssh_ca_public_key="));
     assert!(output.contains("&wss_relay=wss%3A%2F%2Fcontrol.example.test%2Fmedium%2Fv1%2Frelay"));
     assert!(!output.contains("&token="));
     Ok(())
@@ -304,16 +316,14 @@ async fn init_node_preserves_encoded_wss_relay_url_from_invite() -> anyhow::Resu
         .unwrap_or_else(|poison| poison.into_inner());
     let temp = tempfile::tempdir()?;
     let _root = EnvGuard::set("MEDIUM_ROOT", temp.path());
-    let invite = "medium://node?v=1&control=https%3A%2F%2Fcontrol.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test&wss_relay=wss%3A%2F%2Frelay.example.com%2Fmedium%2Fv1%2Frelay%3Ftoken%3Da%2525%26mode%3Db";
+    let invite = format!(
+        "medium://node?v=1&control=https%3A%2F%2Fcontrol.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test&wss_relay=wss%3A%2F%2Frelay.example.com%2Fmedium%2Fv1%2Frelay%3Ftoken%3Da%2525%26mode%3Db{LEGACY_SSH_CA_PARAM}"
+    );
 
-    run_main(vec![
-        "medium".to_string(),
-        "init-node".to_string(),
-        invite.to_string(),
-    ])
-    .await
-    .map_err(anyhow::Error::msg)?
-    .expect("init-node should return a summary");
+    run_main(vec!["medium".to_string(), "init-node".to_string(), invite])
+        .await
+        .map_err(anyhow::Error::msg)?
+        .expect("init-node should return a summary");
 
     let node_unit = fs::read_to_string(
         temp.path()
@@ -424,16 +434,14 @@ async fn init_node_creates_node_config_and_agent_unit_from_node_invite() -> anyh
     let _node_id = EnvGuard::set_str("MEDIUM_NODE_ID", "office-server");
     let _node_listen = EnvGuard::set_str("MEDIUM_NODE_LISTEN_ADDR", "0.0.0.0:17001");
     let _node_public = EnvGuard::set_str("MEDIUM_NODE_PUBLIC_ADDR", "203.0.113.10:17001");
-    let invite = "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test&service_ca_cert=-----BEGIN%20CERTIFICATE-----%0Atest-cert%0A-----END%20CERTIFICATE-----%0A&service_ca_key=-----BEGIN%20PRIVATE%20KEY-----%0Atest-key%0A-----END%20PRIVATE%20KEY-----%0A";
+    let invite = format!(
+        "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test&service_ca_cert=-----BEGIN%20CERTIFICATE-----%0Atest-cert%0A-----END%20CERTIFICATE-----%0A&service_ca_key=-----BEGIN%20PRIVATE%20KEY-----%0Atest-key%0A-----END%20PRIVATE%20KEY-----%0A{LEGACY_SSH_CA_PARAM}"
+    );
 
-    let output = run_main(vec![
-        "medium".to_string(),
-        "init-node".to_string(),
-        invite.to_string(),
-    ])
-    .await
-    .map_err(anyhow::Error::msg)?
-    .expect("init-node should return a summary");
+    let output = run_main(vec!["medium".to_string(), "init-node".to_string(), invite])
+        .await
+        .map_err(anyhow::Error::msg)?
+        .expect("init-node should return a summary");
 
     let node_config_path = temp.path().join("home/.medium/node.toml");
     let services_config_path = temp.path().join("home/.medium/services.toml");
@@ -491,6 +499,47 @@ async fn init_node_creates_node_config_and_agent_unit_from_node_invite() -> anyh
 }
 
 #[tokio::test]
+async fn init_node_fetches_ssh_ca_public_key_from_control_plane() -> anyhow::Result<()> {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let temp = tempfile::tempdir()?;
+    let _root = EnvGuard::set("MEDIUM_ROOT", temp.path());
+    let _node_id = EnvGuard::set_str("MEDIUM_NODE_ID", "office-server");
+    let _node_listen = EnvGuard::set_str("MEDIUM_NODE_LISTEN_ADDR", "0.0.0.0:17001");
+    let _node_public = EnvGuard::set_str("MEDIUM_NODE_PUBLIC_ADDR", "203.0.113.10:17001");
+    let server = TestTlsControlServer::start(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMediumSshCaFromControl medium-ssh-ca\n",
+    )
+    .await;
+    let invite = format!(
+        "medium://node?v=1&control={}&security=pinned-tls&control_pin={}&shared_secret=medium-shared-secret-test",
+        server.url, server.control_pin
+    );
+
+    run_main(vec![
+        "medium".to_string(),
+        "init-node".to_string(),
+        invite.to_string(),
+    ])
+    .await
+    .map_err(anyhow::Error::msg)?
+    .expect("init-node should return a summary");
+
+    let ca_public_key_path = temp.path().join("etc/medium/ssh-ca.pub");
+    let sshd_config_path = temp.path().join("etc/ssh/sshd_config.d/99-medium.conf");
+    assert_eq!(
+        fs::read_to_string(&ca_public_key_path)?,
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMediumSshCaFromControl medium-ssh-ca\n"
+    );
+    assert!(fs::read_to_string(&sshd_config_path)?.contains(&format!(
+        "TrustedUserCAKeys {}",
+        ca_public_key_path.display()
+    )));
+    Ok(())
+}
+
+#[tokio::test]
 async fn init_node_reconfigure_preserves_existing_services_config() -> anyhow::Result<()> {
     let _guard = env_lock()
         .lock()
@@ -498,13 +547,17 @@ async fn init_node_reconfigure_preserves_existing_services_config() -> anyhow::R
     let temp = tempfile::tempdir()?;
     let _root = EnvGuard::set("MEDIUM_ROOT", temp.path());
     let _node_id = EnvGuard::set_str("MEDIUM_NODE_ID", "office-server");
-    let first_invite = "medium://node?v=1&control=https://control-one.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-one";
-    let second_invite = "medium://node?v=1&control=https://control-two.example.test&security=pinned-tls&control_pin=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&shared_secret=medium-shared-secret-two";
+    let first_invite = format!(
+        "medium://node?v=1&control=https://control-one.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-one{LEGACY_SSH_CA_PARAM}"
+    );
+    let second_invite = format!(
+        "medium://node?v=1&control=https://control-two.example.test&security=pinned-tls&control_pin=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&shared_secret=medium-shared-secret-two{LEGACY_SSH_CA_PARAM}"
+    );
 
     run_main(vec![
         "medium".to_string(),
         "init-node".to_string(),
-        first_invite.to_string(),
+        first_invite,
     ])
     .await
     .map_err(anyhow::Error::msg)?;
@@ -516,7 +569,7 @@ async fn init_node_reconfigure_preserves_existing_services_config() -> anyhow::R
     run_main(vec![
         "medium".to_string(),
         "init-node".to_string(),
-        second_invite.to_string(),
+        second_invite,
         "--reconfigure".to_string(),
     ])
     .await
@@ -551,16 +604,14 @@ async fn init_node_uses_macos_application_support_without_systemd() -> anyhow::R
     let _node_id = EnvGuard::set_str("MEDIUM_NODE_ID", "mac-node");
     let _node_listen = EnvGuard::set_str("MEDIUM_NODE_LISTEN_ADDR", "127.0.0.1:17001");
     let _node_public = EnvGuard::set_str("MEDIUM_NODE_PUBLIC_ADDR", "127.0.0.1:17001");
-    let invite = "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test";
+    let invite = format!(
+        "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test{LEGACY_SSH_CA_PARAM}"
+    );
 
-    let output = run_main(vec![
-        "medium".to_string(),
-        "init-node".to_string(),
-        invite.to_string(),
-    ])
-    .await
-    .map_err(anyhow::Error::msg)?
-    .expect("init-node should return a summary");
+    let output = run_main(vec!["medium".to_string(), "init-node".to_string(), invite])
+        .await
+        .map_err(anyhow::Error::msg)?
+        .expect("init-node should return a summary");
 
     let node_config_path = home_dir.join(".medium/node.toml");
     let services_config_path = home_dir.join(".medium/services.toml");
@@ -628,15 +679,13 @@ async fn init_node_derives_public_node_addr_for_default_wildcard_bind() -> anyho
     let _node_listen = EnvGuard::set_str("MEDIUM_NODE_LISTEN_ADDR", "0.0.0.0:17001");
     let _clear_node = EnvGuard::set_str("MEDIUM_NODE_PUBLIC_ADDR", "");
     let _clear_legacy_node = EnvGuard::set_str("MEDIUM_HOME_NODE_BIND_ADDR", "");
-    let invite = "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test";
+    let invite = format!(
+        "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test{LEGACY_SSH_CA_PARAM}"
+    );
 
-    run_main(vec![
-        "medium".to_string(),
-        "init-node".to_string(),
-        invite.to_string(),
-    ])
-    .await
-    .map_err(anyhow::Error::msg)?;
+    run_main(vec!["medium".to_string(), "init-node".to_string(), invite])
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     let node_config = load_from_path(&temp.path().join("home/.medium/node.toml"))?;
     let public_addr = node_config
@@ -647,4 +696,76 @@ async fn init_node_derives_public_node_addr_for_default_wildcard_bind() -> anyho
     assert!(public_addr.ends_with(":17001"));
     assert!(!public_addr.starts_with("0.0.0.0:"));
     Ok(())
+}
+
+struct TestTlsControlServer {
+    url: String,
+    control_pin: String,
+}
+
+impl TestTlsControlServer {
+    async fn start(ssh_ca_public_key: &'static str) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let key_pair = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let control_pin = sha256_pin(cert.der().as_ref());
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut request = [0_u8; 1024];
+                    let Ok(n) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    let (status, body) = if request.starts_with("GET /api/ssh/ca.pub ") {
+                        ("200 OK", ssh_ca_public_key)
+                    } else {
+                        ("404 Not Found", "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Self {
+            url: format!("https://{addr}"),
+            control_pin,
+        }
+    }
+}
+
+fn sha256_pin(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{}", hex_lower(&digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

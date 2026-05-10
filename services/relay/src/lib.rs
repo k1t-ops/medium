@@ -15,9 +15,22 @@ use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::Instant;
 
-type WaitingNodes = Arc<Mutex<HashMap<String, Vec<TcpStream>>>>;
-type WaitingWebSocketNodes = Arc<Mutex<HashMap<String, Vec<WebSocket>>>>;
+const RELAY_NODE_SOCKET_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct WaitingTcpNode {
+    connected_at: Instant,
+    stream: TcpStream,
+}
+
+struct WaitingWebSocketNode {
+    connected_at: Instant,
+    socket: WebSocket,
+}
+
+type WaitingNodes = Arc<Mutex<HashMap<String, Vec<WaitingTcpNode>>>>;
+type WaitingWebSocketNodes = Arc<Mutex<HashMap<String, Vec<WaitingWebSocketNode>>>>;
 type RendezvousNodes = Arc<Mutex<HashMap<String, SocketAddr>>>;
 
 #[derive(Clone)]
@@ -81,6 +94,75 @@ pub async fn run_wss_relay_with_shutdown(
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn tcp_relay_wait_discards_expired_node_sockets_and_waits_for_fresh_one()
+    -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let stale_client = TcpStream::connect(addr).await?;
+        let (stale_relay, _) = listener.accept().await?;
+        let fresh_client = TcpStream::connect(addr).await?;
+        let (fresh_relay, _) = listener.accept().await?;
+
+        let waiting_nodes: WaitingNodes = Arc::new(Mutex::new(HashMap::new()));
+        waiting_nodes
+            .lock()
+            .await
+            .entry("node-1".into())
+            .or_default()
+            .push(WaitingTcpNode {
+                connected_at: tokio::time::Instant::now() - std::time::Duration::from_secs(10),
+                stream: stale_relay,
+            });
+
+        let delayed_waiting_nodes = waiting_nodes.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            delayed_waiting_nodes
+                .lock()
+                .await
+                .entry("node-1".into())
+                .or_default()
+                .push(WaitingTcpNode {
+                    connected_at: tokio::time::Instant::now(),
+                    stream: fresh_relay,
+                });
+        });
+
+        let mut selected = wait_for_node_stream_with_ttl(
+            waiting_nodes,
+            "node-1",
+            std::time::Duration::from_millis(100),
+        )
+        .await?;
+
+        selected.write_all(b"fresh").await?;
+        let mut stale_client = stale_client;
+        let mut fresh_client = fresh_client;
+        let mut buffer = [0_u8; 5];
+        let fresh_read = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            fresh_client.read_exact(&mut buffer),
+        )
+        .await??;
+        assert_eq!(fresh_read, 5);
+        assert_eq!(&buffer, b"fresh");
+
+        let stale_result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stale_client.read(&mut buffer),
+        )
+        .await??;
+        assert_eq!(stale_result, 0, "expired stale relay socket was not closed");
+        Ok(())
+    }
 }
 
 pub async fn run_tcp_relay_with_shutdown(
@@ -353,7 +435,10 @@ async fn handle_connection(
                 .await
                 .entry(node_id)
                 .or_default()
-                .push(stream);
+                .push(WaitingTcpNode {
+                    connected_at: Instant::now(),
+                    stream,
+                });
         }
         RelayHello::Client { node_id } => {
             tracing::info!(%node_id, "TCP relay client connected");
@@ -376,10 +461,37 @@ async fn wait_for_node_stream(
     waiting_nodes: WaitingNodes,
     node_id: &str,
 ) -> anyhow::Result<TcpStream> {
+    wait_for_node_stream_with_ttl(waiting_nodes, node_id, RELAY_NODE_SOCKET_TTL).await
+}
+
+async fn wait_for_node_stream_with_ttl(
+    waiting_nodes: WaitingNodes,
+    node_id: &str,
+    ttl: std::time::Duration,
+) -> anyhow::Result<TcpStream> {
     for _ in 0..50 {
         if let Some(stream) = {
             let mut waiting = waiting_nodes.lock().await;
-            waiting.get_mut(node_id).and_then(Vec::pop)
+            let mut selected = None;
+            if let Some(nodes) = waiting.get_mut(node_id) {
+                while let Some(node) = nodes.pop() {
+                    let age = node.connected_at.elapsed();
+                    if age <= ttl {
+                        selected = Some(node.stream);
+                        break;
+                    }
+                    tracing::info!(
+                        %node_id,
+                        age_ms = age.as_millis(),
+                        ttl_ms = ttl.as_millis(),
+                        "discarding expired TCP relay node socket"
+                    );
+                }
+                if nodes.is_empty() {
+                    waiting.remove(node_id);
+                }
+            }
+            selected
         } {
             return Ok(stream);
         }
@@ -421,7 +533,10 @@ async fn handle_wss_connection(mut socket: WebSocket, state: RelayState) -> anyh
                 .await
                 .entry(node_id)
                 .or_default()
-                .push(socket);
+                .push(WaitingWebSocketNode {
+                    connected_at: Instant::now(),
+                    socket,
+                });
         }
         RelayHello::Client { node_id } => {
             tracing::info!(%node_id, "WSS relay client connected");
@@ -454,7 +569,26 @@ async fn wait_for_node_websocket(
     for _ in 0..50 {
         if let Some(socket) = {
             let mut waiting = waiting_nodes.lock().await;
-            waiting.get_mut(node_id).and_then(Vec::pop)
+            let mut selected = None;
+            if let Some(nodes) = waiting.get_mut(node_id) {
+                while let Some(node) = nodes.pop() {
+                    let age = node.connected_at.elapsed();
+                    if age <= RELAY_NODE_SOCKET_TTL {
+                        selected = Some(node.socket);
+                        break;
+                    }
+                    tracing::info!(
+                        %node_id,
+                        age_ms = age.as_millis(),
+                        ttl_ms = RELAY_NODE_SOCKET_TTL.as_millis(),
+                        "discarding expired WSS relay node socket"
+                    );
+                }
+                if nodes.is_empty() {
+                    waiting.remove(node_id);
+                }
+            }
+            selected
         } {
             return Ok(socket);
         }

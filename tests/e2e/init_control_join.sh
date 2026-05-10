@@ -166,12 +166,8 @@ OVERLAY_HOME="$client_home" cargo run -p medium-cli --bin medium -- devices >"$d
 grep -q "node-1 ssh overlay@127.0.0.1:1" "$devices_log"
 
 mkdir -p "$client_home/.ssh/config.d"
-OVERLAY_HOME="$client_home" cargo run -p medium-cli --bin medium -- \
-  ssh sync --write-main-config >"$sync_log"
-grep -q "synced 1 SSH hosts" "$sync_log"
-grep -q "Include ~/.ssh/config.d/medium.conf" "$client_home/.ssh/config"
-grep -q "Host node-1" "$client_home/.ssh/config.d/medium.conf"
-grep -q "ProxyCommand medium proxy ssh --device node-1" "$client_home/.ssh/config.d/medium.conf"
+OVERLAY_HOME="$client_home" cargo run -p medium-cli --bin medium -- services >"$sync_log"
+grep -q "svc_ssh ssh ssh://overlay@node-1 -> $target_addr" "$sync_log"
 
 cat >"$bin_dir/medium" <<EOF
 #!/usr/bin/env bash

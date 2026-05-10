@@ -9,6 +9,7 @@ pub struct Invite {
     pub control_url: String,
     pub security: String,
     pub control_pin: String,
+    pub client_secret: Option<String>,
 }
 
 pub fn parse_invite(raw: &str) -> anyhow::Result<Invite> {
@@ -30,6 +31,7 @@ pub fn parse_invite(raw: &str) -> anyhow::Result<Invite> {
     let mut control_url = None;
     let mut security = None;
     let mut control_pin = None;
+    let mut client_secret = None;
 
     for pair in query.split('&') {
         let (key, value) = pair
@@ -62,6 +64,12 @@ pub fn parse_invite(raw: &str) -> anyhow::Result<Invite> {
                 }
                 control_pin = Some(value.to_string());
             }
+            "client_secret" => {
+                if value.is_empty() {
+                    bail!("invite client secret cannot be empty");
+                }
+                client_secret = Some(value.to_string());
+            }
             _ => {}
         }
     }
@@ -80,5 +88,6 @@ pub fn parse_invite(raw: &str) -> anyhow::Result<Invite> {
         control_url: control_url.context("invite is missing control URL")?,
         security,
         control_pin: control_pin.context("invite is missing control pin")?,
+        client_secret,
     })
 }

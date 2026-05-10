@@ -20,10 +20,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
+    Connector, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
 };
 
 const RELAY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const RELAY_NODE_IDLE_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+type ProxyServices = Arc<HashMap<String, ProxyService>>;
 
 pub async fn run_tcp_proxy(cfg: NodeConfig, shared_secret: &str) -> anyhow::Result<()> {
     spawn_configured_connectors(&cfg, shared_secret);
@@ -78,8 +80,18 @@ fn spawn_relay_connectors(cfg: &NodeConfig, shared_secret: &str, relay_addr: &st
         let shared_secret = shared_secret.to_string();
         let relay_addr = relay_addr.to_string();
         tokio::spawn(async move {
+            let services = loop {
+                match proxy_services_from_config(&cfg, &shared_secret).await {
+                    Ok(services) => break services,
+                    Err(error) => {
+                        tracing::warn!(%error, "relay connector service preparation failed");
+                        tokio::time::sleep(RELAY_RECONNECT_DELAY).await;
+                    }
+                }
+            };
             loop {
-                match connect_relay_once(&cfg, &shared_secret, &relay_addr).await {
+                match connect_relay_once(&cfg, &shared_secret, &relay_addr, services.clone()).await
+                {
                     Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(%error, "relay connector failed");
@@ -97,8 +109,24 @@ fn spawn_wss_relay_connectors(cfg: &NodeConfig, shared_secret: &str, relay_url: 
         let shared_secret = shared_secret.to_string();
         let relay_url = relay_url.to_string();
         tokio::spawn(async move {
+            let services = loop {
+                match proxy_services_from_config(&cfg, &shared_secret).await {
+                    Ok(services) => break services,
+                    Err(error) => {
+                        tracing::warn!(%error, "wss relay connector service preparation failed");
+                        tokio::time::sleep(RELAY_RECONNECT_DELAY).await;
+                    }
+                }
+            };
             loop {
-                match connect_wss_relay_once(&cfg, &shared_secret, &relay_url).await {
+                match connect_wss_relay_once_with_services(
+                    &cfg,
+                    &shared_secret,
+                    &relay_url,
+                    services.clone(),
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(error) => {
                         tracing::warn!(%error, "wss relay connector failed");
@@ -114,6 +142,24 @@ async fn connect_relay_once(
     cfg: &NodeConfig,
     shared_secret: &str,
     relay_addr: &str,
+    services: ProxyServices,
+) -> anyhow::Result<()> {
+    connect_relay_once_with_idle_timeout(
+        cfg,
+        shared_secret,
+        relay_addr,
+        services,
+        RELAY_NODE_IDLE_LEASE,
+    )
+    .await
+}
+
+async fn connect_relay_once_with_idle_timeout(
+    cfg: &NodeConfig,
+    shared_secret: &str,
+    relay_addr: &str,
+    services: ProxyServices,
+    idle_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     tracing::info!(
         node_id = %cfg.node_id,
@@ -140,14 +186,23 @@ async fn connect_relay_once(
         "sent TCP relay node hello"
     );
 
-    let services = proxy_services_from_config(cfg, shared_secret).await?;
-    handle_connection(stream, services, &cfg.node_id, shared_secret).await
+    handle_relay_connection(stream, services, &cfg.node_id, shared_secret, idle_timeout).await
 }
 
 pub async fn connect_wss_relay_once(
     cfg: &NodeConfig,
     shared_secret: &str,
     relay_url: &str,
+) -> anyhow::Result<()> {
+    let services = proxy_services_from_config(cfg, shared_secret).await?;
+    connect_wss_relay_once_with_services(cfg, shared_secret, relay_url, services).await
+}
+
+async fn connect_wss_relay_once_with_services(
+    cfg: &NodeConfig,
+    shared_secret: &str,
+    relay_url: &str,
+    services: ProxyServices,
 ) -> anyhow::Result<()> {
     tracing::info!(
         node_id = %cfg.node_id,
@@ -183,15 +238,6 @@ pub async fn connect_wss_relay_once(
         %relay_url,
         "sent WSS relay node hello"
     );
-    serve_wss_node_socket(cfg.clone(), ws, shared_secret).await
-}
-
-async fn serve_wss_node_socket(
-    cfg: NodeConfig,
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    shared_secret: &str,
-) -> anyhow::Result<()> {
-    let services = proxy_services_from_config(&cfg, shared_secret).await?;
     handle_wss_connection(ws, services, &cfg.node_id, shared_secret).await
 }
 
@@ -451,11 +497,35 @@ fn effective_udp_rendezvous_addr(cfg: &NodeConfig) -> Option<String> {
 
 async fn handle_connection(
     mut inbound: TcpStream,
-    services: HashMap<String, ProxyService>,
+    services: ProxyServices,
     expected_node_id: &str,
     shared_secret: &str,
 ) -> anyhow::Result<()> {
     let hello = read_session_hello(&mut inbound).await?;
+    handle_connection_with_hello(inbound, hello, services, expected_node_id, shared_secret).await
+}
+
+async fn handle_relay_connection(
+    mut inbound: TcpStream,
+    services: ProxyServices,
+    expected_node_id: &str,
+    shared_secret: &str,
+    idle_timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let hello = match tokio::time::timeout(idle_timeout, read_session_hello(&mut inbound)).await {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!("relay node socket idle lease expired after {idle_timeout:?}"),
+    };
+    handle_connection_with_hello(inbound, hello, services, expected_node_id, shared_secret).await
+}
+
+async fn handle_connection_with_hello(
+    inbound: TcpStream,
+    hello: SessionHello,
+    services: ProxyServices,
+    expected_node_id: &str,
+    shared_secret: &str,
+) -> anyhow::Result<()> {
     tracing::info!(
         service_id = %hello.service_id,
         expected_node_id,
@@ -483,7 +553,7 @@ async fn handle_connection(
 
 async fn handle_wss_connection<S>(
     ws: WebSocketStream<S>,
-    services: HashMap<String, ProxyService>,
+    services: ProxyServices,
     expected_node_id: &str,
     shared_secret: &str,
 ) -> anyhow::Result<()>
@@ -491,7 +561,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut ws_tx, mut ws_rx) = ws.split();
-    let (hello, initial_payload) = read_wss_session_hello(&mut ws_rx).await?;
+    let (hello, initial_payload) =
+        match tokio::time::timeout(RELAY_NODE_IDLE_LEASE, read_wss_session_hello(&mut ws_rx)).await
+        {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!(
+                "wss relay node socket idle lease expired after {RELAY_NODE_IDLE_LEASE:?}"
+            ),
+        };
     tracing::info!(
         service_id = %hello.service_id,
         expected_node_id,
@@ -565,12 +642,20 @@ struct ProxyService {
     kind: String,
     target: String,
     tls_config: Option<Arc<ServerConfig>>,
+    tls_mode: ServiceTlsMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceTlsMode {
+    None,
+    Http,
+    Raw,
 }
 
 async fn proxy_services_from_config(
     cfg: &NodeConfig,
     shared_secret: &str,
-) -> anyhow::Result<HashMap<String, ProxyService>> {
+) -> anyhow::Result<ProxyServices> {
     let mut services = HashMap::new();
     for service in &cfg.services {
         if !service.enabled {
@@ -578,7 +663,12 @@ async fn proxy_services_from_config(
         }
         let kind = service.kind.to_ascii_lowercase();
         let hostname = service_hostname(service);
-        let tls_config = if kind == "http" {
+        let tls_mode = match kind.as_str() {
+            "http" => ServiceTlsMode::Http,
+            "ssh" => ServiceTlsMode::Raw,
+            _ => ServiceTlsMode::None,
+        };
+        let tls_config = if tls_mode != ServiceTlsMode::None {
             Some(Arc::new(
                 http_service_tls_config(cfg, shared_secret, &service.id, &hostname).await?,
             ))
@@ -592,10 +682,11 @@ async fn proxy_services_from_config(
                 kind,
                 target: service.target.clone(),
                 tls_config,
+                tls_mode,
             },
         );
     }
-    Ok(services)
+    Ok(Arc::new(services))
 }
 
 async fn http_service_tls_config(
@@ -673,6 +764,21 @@ where
             .await
             .with_context(|| format!("accept TLS for service {}", service.id))?;
         tracing::info!(service_id = %service.id, "accepted Medium TLS for service");
+
+        if service.tls_mode == ServiceTlsMode::Raw {
+            let mut outbound = TcpStream::connect(&service.target).await.with_context(|| {
+                format!("connect service {} target {}", service.id, service.target)
+            })?;
+            tracing::info!(
+                service_id = %service.id,
+                target = %service.target,
+                "connected raw TLS-wrapped service target"
+            );
+            let _ = copy_bidirectional(&mut inbound, &mut outbound).await?;
+            tracing::info!(service_id = %service.id, "finished raw TLS-wrapped service proxy");
+            return Ok(());
+        }
+
         let request = read_http_request_for_proxy(&mut inbound, service).await?;
         let mut outbound = match TcpStream::connect(&service.target).await {
             Ok(outbound) => outbound,
@@ -1007,4 +1113,228 @@ where
     }
 
     anyhow::bail!("missing session hello")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use overlay_crypto::{issue_medium_service_ca, issue_session_token};
+    use overlay_transport::session::read_relay_hello;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsConnector;
+
+    #[tokio::test]
+    async fn tcp_relay_connector_does_not_advertise_before_services_are_ready() {
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let cfg: NodeConfig = toml::from_str(&format!(
+            r#"
+node_id = "node-1"
+bind_addr = "127.0.0.1:0"
+
+[[services]]
+id = "svc_ssh"
+kind = "ssh"
+target = "127.0.0.1:22"
+"#
+        ))
+        .unwrap();
+
+        spawn_relay_connectors(&cfg, "relay-secret", &relay_addr.to_string());
+
+        let advertised =
+            tokio::time::timeout(std::time::Duration::from_millis(300), relay.accept()).await;
+        assert!(
+            advertised.is_err(),
+            "node advertised a relay socket before service TLS config was ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_path_completes_medium_tls_for_ssh_service() -> anyhow::Result<()> {
+        let ca = issue_medium_service_ca()?;
+        let target_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = target_listener.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let (stream, _) = target_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut client_banner = String::new();
+            reader.read_line(&mut client_banner).await.unwrap();
+            assert_eq!(client_banner, "SSH-2.0-MediumClient\r\n");
+            reader
+                .get_mut()
+                .write_all(b"SSH-2.0-MediumTarget\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (relay_shutdown_tx, relay_shutdown_rx) = oneshot::channel();
+        let (relay_addr_tx, relay_addr_rx) = oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            relay::run_tcp_relay_with_shutdown(
+                "127.0.0.1:0",
+                Some("relay-secret".into()),
+                relay_shutdown_rx,
+                Some(relay_addr_tx),
+            )
+            .await
+            .unwrap();
+        });
+        let relay_addr = relay_addr_rx.await?;
+
+        let cfg: NodeConfig = toml::from_str(&format!(
+            r#"
+node_id = "node-1"
+bind_addr = "127.0.0.1:0"
+service_ca_cert_pem = """
+{cert}
+"""
+service_ca_key_pem = """
+{key}
+"""
+
+[[services]]
+id = "svc_ssh"
+kind = "ssh"
+target = "{target_addr}"
+"#,
+            cert = ca.cert_pem,
+            key = ca.key_pem,
+        ))?;
+        let services = proxy_services_from_config(&cfg, "relay-secret").await?;
+        let connector_cfg = cfg.clone();
+        let relay_addr = relay_addr.to_string();
+        let connector_relay_addr = relay_addr.clone();
+        let connector = tokio::spawn(async move {
+            connect_relay_once(
+                &connector_cfg,
+                "relay-secret",
+                &connector_relay_addr,
+                services,
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(&relay_addr).await?;
+        write_relay_hello(
+            &mut client,
+            &RelayHello::Client {
+                node_id: "node-1".into(),
+            },
+        )
+        .await?;
+        overlay_transport::session::write_session_hello(
+            &mut client,
+            &SessionHello {
+                token: issue_session_token("relay-secret", "sess-relay-ssh", "svc_ssh", "node-1")?,
+                service_id: "svc_ssh".into(),
+                transport: None,
+            },
+        )
+        .await?;
+
+        let connector_tls = TlsConnector::from(Arc::new(client_tls_config(&ca.cert_pem)?));
+        let server_name = ServerName::try_from("svc-ssh.medium")?;
+        let mut tls = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connector_tls.connect(server_name, client),
+        )
+        .await??;
+        tls.write_all(b"SSH-2.0-MediumClient\r\n").await?;
+        let mut reader = BufReader::new(tls);
+        let mut target_banner = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut target_banner),
+        )
+        .await??;
+        assert_eq!(target_banner, "SSH-2.0-MediumTarget\r\n");
+        drop(reader);
+
+        let _ = relay_shutdown_tx.send(());
+        target_task.await?;
+        connector.abort();
+        let _ = connector.await;
+        relay_task.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_connector_closes_idle_socket_after_lease() -> anyhow::Result<()> {
+        let ca = issue_medium_service_ca()?;
+        let relay = TcpListener::bind("127.0.0.1:0").await?;
+        let relay_addr = relay.local_addr()?;
+        let cfg: NodeConfig = toml::from_str(&format!(
+            r#"
+node_id = "node-1"
+bind_addr = "127.0.0.1:0"
+service_ca_cert_pem = """
+{cert}
+"""
+service_ca_key_pem = """
+{key}
+"""
+
+[[services]]
+id = "svc_ssh"
+kind = "ssh"
+target = "127.0.0.1:22"
+"#,
+            cert = ca.cert_pem,
+            key = ca.key_pem,
+        ))?;
+        let services = proxy_services_from_config(&cfg, "relay-secret").await?;
+        let connector = tokio::spawn(async move {
+            connect_relay_once_with_idle_timeout(
+                &cfg,
+                "relay-secret",
+                &relay_addr.to_string(),
+                services,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+        });
+
+        let (mut node_socket, _) = relay.accept().await?;
+        assert_eq!(
+            read_relay_hello(&mut node_socket).await?,
+            RelayHello::Node {
+                node_id: "node-1".into(),
+                shared_secret: "relay-secret".into(),
+            }
+        );
+        let mut buffer = [0_u8; 1];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            node_socket.read(&mut buffer),
+        )
+        .await??;
+        assert_eq!(read, 0, "idle relay node socket stayed open past lease");
+
+        let result = connector.await?;
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("idle lease expired"),
+            "unexpected connector error: {error:#}"
+        );
+        Ok(())
+    }
+
+    fn client_tls_config(ca_cert_pem: &str) -> anyhow::Result<rustls::ClientConfig> {
+        let mut reader = std::io::BufReader::new(ca_cert_pem.as_bytes());
+        let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(CertificateDer::from(cert))?;
+        }
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        Ok(
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }
 }

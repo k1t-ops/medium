@@ -887,49 +887,7 @@ fn ice_checklist_with_preference(
     grant: &SessionOpenGrant,
     preferred: Option<&IceCandidate>,
 ) -> Vec<IceCandidate> {
-    let Some(ice) = &grant.authorization.ice else {
-        return Vec::new();
-    };
-    let mut candidates = ice
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.transport.eq_ignore_ascii_case("udp"))
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        candidate_preference_rank(left, preferred)
-            .cmp(&candidate_preference_rank(right, preferred))
-            .then_with(|| {
-                ice_kind_rank(left.kind)
-                    .cmp(&ice_kind_rank(right.kind))
-                    .then_with(|| right.priority.cmp(&left.priority))
-                    .then_with(|| left.foundation.cmp(&right.foundation))
-            })
-    });
-    candidates
-}
-
-fn candidate_preference_rank(candidate: &IceCandidate, preferred: Option<&IceCandidate>) -> u8 {
-    if preferred.is_some_and(|preferred| same_ice_candidate(candidate, preferred)) {
-        0
-    } else {
-        1
-    }
-}
-
-fn same_ice_candidate(left: &IceCandidate, right: &IceCandidate) -> bool {
-    left.transport.eq_ignore_ascii_case(&right.transport)
-        && left.kind == right.kind
-        && left.addr == right.addr
-        && left.port == right.port
-}
-
-fn ice_kind_rank(kind: IceCandidateKind) -> u8 {
-    match kind {
-        IceCandidateKind::Host => 0,
-        IceCandidateKind::Srflx => 1,
-        IceCandidateKind::Relay => 2,
-    }
+    medium_session::ice_checklist(grant, preferred)
 }
 
 fn ice_candidate_addr(candidate: &IceCandidate) -> String {

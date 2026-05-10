@@ -10,6 +10,7 @@ use crate::routes::{
     nodes::register_node,
     pairing::create_bootstrap_code,
     sessions::open_session,
+    ssh::{issue_ssh_certificate, ssh_ca_public_key},
 };
 use crate::state::ControlState;
 
@@ -27,6 +28,8 @@ pub fn build_router(state: ControlState) -> Router {
         )
         .route("/api/nodes/register", post(register_node))
         .route("/api/sessions/open", get(open_session))
+        .route("/api/ssh/ca.pub", get(ssh_ca_public_key))
+        .route("/api/ssh/certificate", post(issue_ssh_certificate))
         .with_state(state)
         .merge(wss_relay)
 }

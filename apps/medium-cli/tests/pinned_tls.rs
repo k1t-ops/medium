@@ -19,6 +19,7 @@ async fn fetch_devices_enforces_control_certificate_pin() {
         invite_version: 1,
         security: "pinned-tls".to_string(),
         control_pin: server.control_pin.clone(),
+        client_secret: "client-secret".to_string(),
     };
 
     let catalog = client_api::fetch_devices(&state).await.unwrap();
@@ -30,6 +31,12 @@ async fn fetch_devices_enforces_control_certificate_pin() {
     assert_eq!(grant.service_id, "svc_ssh");
     assert_eq!(grant.node_id, "node-1");
 
+    let scoped_grant = client_api::open_session_for_node(&state, Some("studio-smiley"), "svc_ssh")
+        .await
+        .unwrap();
+    assert_eq!(scoped_grant.service_id, "svc_ssh");
+    assert_eq!(scoped_grant.node_id, "studio-smiley");
+
     let wrong_pin_state = AppState {
         control_pin: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             .to_string(),
@@ -38,8 +45,11 @@ async fn fetch_devices_enforces_control_certificate_pin() {
     let error = client_api::fetch_devices(&wrong_pin_state)
         .await
         .unwrap_err();
+    let error = error.to_string();
 
-    assert!(error.to_string().contains("control TLS pin mismatch"));
+    assert!(error.contains("control TLS pin mismatch"));
+    assert!(error.contains(&wrong_pin_state.control_pin));
+    assert!(error.contains(&server.control_pin));
 }
 
 struct TestTlsControlServer {
@@ -89,6 +99,10 @@ impl TestTlsControlServer {
                         "GET /api/sessions/open?service_id=svc_ssh&requester_device_id=client ",
                     ) {
                         r#"{"session_id":"session-1","service_id":"svc_ssh","node_id":"node-1","relay_hint":null,"authorization":{"token":"token-1","expires_at":"2099-01-01T00:00:00Z","candidates":[{"addr":"127.0.0.1:17001"}]}}"#
+                    } else if request.starts_with(
+                        "GET /api/sessions/open?service_id=svc_ssh&requester_device_id=client&node_id=studio-smiley ",
+                    ) {
+                        r#"{"session_id":"session-2","service_id":"svc_ssh","node_id":"studio-smiley","relay_hint":null,"authorization":{"token":"token-2","expires_at":"2099-01-01T00:00:00Z","candidates":[{"addr":"192.168.1.126:17001"}]}}"#
                     } else {
                         return;
                     };

@@ -29,7 +29,13 @@ fn candidate_order_prefers_direct_then_wss_relay() {
         },
     };
 
-    let ordered = medium_cli::cli::candidate_order_for_test(&grant);
+    let ordered = medium_session::ordered_legacy_candidates_for_mode(
+        &grant,
+        medium_session::TransportMode::Auto,
+    )
+    .into_iter()
+    .map(|candidate| candidate.kind)
+    .collect::<Vec<_>>();
 
     assert_eq!(
         ordered,
@@ -80,7 +86,13 @@ fn candidate_order_ignores_optional_ice_section_for_legacy_connectors() {
         },
     };
 
-    let ordered = medium_cli::cli::candidate_order_for_test(&grant);
+    let ordered = medium_session::ordered_legacy_candidates_for_mode(
+        &grant,
+        medium_session::TransportMode::Auto,
+    )
+    .into_iter()
+    .map(|candidate| candidate.kind)
+    .collect::<Vec<_>>();
 
     assert_eq!(
         ordered,

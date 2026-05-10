@@ -17,6 +17,8 @@ pub struct AppState {
     pub security: String,
     #[serde(default)]
     pub control_pin: String,
+    #[serde(default)]
+    pub client_secret: String,
 }
 
 impl AppState {

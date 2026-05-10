@@ -1,0 +1,48 @@
+FROM docker.io/library/rust:1-bookworm AS builder
+
+WORKDIR /src
+ENV PATH=/usr/local/cargo/bin:${PATH}
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p control-plane -p home-node -p medium-cli -p relay \
+    && mkdir -p /out \
+    && cp /src/target/release/medium /out/medium \
+    && cp /src/target/release/control-plane /out/control-plane \
+    && cp /src/target/release/home-node /out/node-agent \
+    && cp /src/target/release/relay /out/relay
+
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      iproute2 \
+      netcat-openbsd \
+      nftables \
+      openssh-client \
+      openssh-server \
+      procps \
+      python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash overlay \
+    && passwd -d overlay \
+    && mkdir -p /run/sshd
+
+COPY --from=builder /out/medium /usr/local/bin/medium
+COPY --from=builder /out/control-plane /usr/local/bin/control-plane
+COPY --from=builder /out/node-agent /usr/local/bin/node-agent
+COPY --from=builder /out/relay /usr/local/bin/relay
+COPY tests/netlab/bin/*.sh /usr/local/lib/medium-netlab/
+
+RUN chmod 0755 /usr/local/bin/medium \
+    /usr/local/bin/control-plane \
+    /usr/local/bin/node-agent \
+    /usr/local/bin/relay \
+    /usr/local/lib/medium-netlab/*.sh
+
+CMD ["/bin/bash"]

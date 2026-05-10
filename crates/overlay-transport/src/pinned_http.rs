@@ -22,6 +22,10 @@ where
     Ok(serde_json::from_slice(&response)?)
 }
 
+pub async fn get_bytes(url: &str, control_pin: &str) -> anyhow::Result<Vec<u8>> {
+    request(Method::Get, url, control_pin, None).await
+}
+
 pub async fn post_json<T, B>(url: &str, control_pin: &str, body: &B) -> anyhow::Result<T>
 where
     T: DeserializeOwned,
@@ -100,7 +104,7 @@ async fn request(
     let mut stream = connector
         .connect(server_name, stream)
         .await
-        .with_context(|| format!("control TLS pin mismatch or handshake failed for {url}"))?;
+        .map_err(|error| anyhow::anyhow!("control TLS handshake failed for {url}: {error}"))?;
 
     let path = match url.query() {
         Some(query) => format!("{}?{}", url.path(), query),
@@ -217,8 +221,13 @@ impl ServerCertVerifier for PinnedCertVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
         let actual = Sha256::digest(end_entity.as_ref());
-        if actual.as_slice() != self.expected_pin {
-            return Err(TlsError::General("control TLS pin mismatch".to_string()));
+        let actual_pin: &[u8] = actual.as_ref();
+        if actual_pin != self.expected_pin.as_slice() {
+            return Err(TlsError::General(format!(
+                "control TLS pin mismatch: expected sha256:{} actual sha256:{}",
+                hex_lower(&self.expected_pin),
+                hex_lower(actual_pin)
+            )));
         }
         Ok(ServerCertVerified::assertion())
     }

@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+const LEGACY_SSH_CA_PARAM: &str =
+    "&ssh_ca_public_key=ssh-ed25519%20AAAAC3NzaC1lZDI1NTE5AAAAITestMediumSshCa%20medium-ssh-ca";
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -66,6 +69,22 @@ fn write_mock_systemctl(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn write_failing_systemctl(path: &Path) -> anyhow::Result<()> {
+    fs::write(
+        path,
+        "#!/bin/sh\nset -eu\nif [ \"$*\" = 'reload ssh.service' ]; then exit 0; fi\nprintf 'stdout: %s\\n' \"$*\"\nprintf 'stderr: %s\\n' \"$*\" >&2\nexit 7\n",
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn init_control_renders_units_and_enables_services() -> anyhow::Result<()> {
     let _guard = env_lock()
@@ -96,6 +115,8 @@ async fn init_control_renders_units_and_enables_services() -> anyhow::Result<()>
         .find_map(|line| line.strip_prefix("generated node invite "))
         .expect("init-control should print node invite")
         .to_string();
+    assert!(!node_invite.contains("ssh_ca_public_key="));
+    let node_invite = format!("{node_invite}{LEGACY_SSH_CA_PARAM}");
 
     let control_unit_path = temp
         .path()
@@ -221,6 +242,7 @@ async fn init_control_renders_units_and_enables_services() -> anyhow::Result<()>
             "daemon-reload",
             "enable --now medium-relay.service",
             "enable --now medium-control-plane.service",
+            "reload ssh.service",
             "daemon-reload",
             "enable --now medium-node-agent.service",
         ]
@@ -304,5 +326,78 @@ async fn control_restart_restarts_relay_and_control_plane_services() -> anyhow::
         output,
         "restarted medium-relay.service, medium-control-plane.service"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn node_restart_restarts_node_agent_service() -> anyhow::Result<()> {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let temp = tempfile::tempdir()?;
+    let systemctl_path = temp.path().join("mock-systemctl.sh");
+    let systemctl_log = temp.path().join("systemctl.log");
+    write_mock_systemctl(&systemctl_path)?;
+
+    let _root = EnvGuard::set_path("MEDIUM_ROOT", temp.path());
+    let _systemctl_bin = EnvGuard::set_path("MEDIUM_SYSTEMCTL_BIN", &systemctl_path);
+    let _systemctl_log = EnvGuard::set_path("MEDIUM_SYSTEMCTL_LOG", &systemctl_log);
+
+    let output = run_main(vec![
+        "medium".to_string(),
+        "node".to_string(),
+        "restart".to_string(),
+    ])
+    .await
+    .map_err(anyhow::Error::msg)?
+    .expect("node restart should return a summary");
+
+    let commands = fs::read_to_string(&systemctl_log)?;
+    assert_eq!(
+        commands.lines().collect::<Vec<_>>(),
+        vec!["restart medium-node-agent.service"]
+    );
+    assert_eq!(output, "restarted medium-node-agent.service");
+    Ok(())
+}
+
+#[tokio::test]
+async fn init_node_reports_failing_systemd_command_with_output() -> anyhow::Result<()> {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let temp = tempfile::tempdir()?;
+    let systemctl_path = temp.path().join("mock-systemctl.sh");
+    let failing_systemctl_path = temp.path().join("failing-systemctl.sh");
+    let systemctl_log = temp.path().join("systemctl.log");
+    write_mock_systemctl(&systemctl_path)?;
+    write_failing_systemctl(&failing_systemctl_path)?;
+
+    let _root = EnvGuard::set_path("MEDIUM_ROOT", temp.path());
+    let _public_url = EnvGuard::set_str("OVERLAY_CONTROL_URL", "https://control.example.test");
+    let systemctl_bin = EnvGuard::set_path("MEDIUM_SYSTEMCTL_BIN", &systemctl_path);
+    let _systemctl_log = EnvGuard::set_path("MEDIUM_SYSTEMCTL_LOG", &systemctl_log);
+
+    drop(systemctl_bin);
+    let _failing_systemctl_bin =
+        EnvGuard::set_path("MEDIUM_SYSTEMCTL_BIN", &failing_systemctl_path);
+    let node_invite = format!(
+        "medium://node?v=1&control=https://control.example.test&security=pinned-tls&control_pin=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&shared_secret=medium-shared-secret-test{LEGACY_SSH_CA_PARAM}"
+    );
+
+    let error = run_main(vec![
+        "medium".to_string(),
+        "init-node".to_string(),
+        node_invite,
+    ])
+    .await
+    .expect_err("init-node should fail when systemctl fails");
+
+    assert!(error.contains("systemd setup failed"));
+    assert!(error.contains("command failed:"));
+    assert!(error.contains("daemon-reload"));
+    assert!(error.contains("exit status: 7"));
+    assert!(error.contains("stderr: daemon-reload"));
+    assert!(error.contains("stdout: daemon-reload"));
     Ok(())
 }

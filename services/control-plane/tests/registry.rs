@@ -138,3 +138,61 @@ async fn registry_resolves_service_route_for_session_open() {
     assert_eq!(route.tcp_addr, "127.0.0.1:17001");
     assert_eq!(route.user_name.as_deref(), Some("overlay"));
 }
+
+#[tokio::test]
+async fn registry_scopes_service_ids_by_node_for_default_ssh_services() {
+    let store = control_plane::registry::RegistryStore::in_memory()
+        .await
+        .unwrap();
+    store
+        .register_node(&RegisterNodeRequest {
+            node_id: "node-1".into(),
+            node_label: "Node 1".into(),
+            endpoints: vec![NodeEndpoint {
+                kind: EndpointKind::TcpProxy,
+                schema_version: 1,
+                addr: "127.0.0.1:17001".into(),
+                priority: 10,
+            }],
+            services: vec![PublishedService {
+                id: "svc_ssh".into(),
+                kind: ServiceKind::Ssh,
+                schema_version: 1,
+                label: None,
+                target: "127.0.0.1:22".into(),
+                user_name: Some("overlay".into()),
+            }],
+        })
+        .await
+        .unwrap();
+    store
+        .register_node(&RegisterNodeRequest {
+            node_id: "studio-smiley".into(),
+            node_label: "studio-smiley".into(),
+            endpoints: vec![NodeEndpoint {
+                kind: EndpointKind::TcpProxy,
+                schema_version: 1,
+                addr: "192.168.1.126:17001".into(),
+                priority: 10,
+            }],
+            services: vec![PublishedService {
+                id: "svc_ssh".into(),
+                kind: ServiceKind::Ssh,
+                schema_version: 1,
+                label: None,
+                target: "127.0.0.1:22".into(),
+                user_name: Some("overlay".into()),
+            }],
+        })
+        .await
+        .unwrap();
+
+    let route = store
+        .resolve_node_service_route("studio-smiley", "svc_ssh")
+        .await
+        .unwrap();
+
+    assert_eq!(route.node_id, "studio-smiley");
+    assert_eq!(route.tcp_addr, "192.168.1.126:17001");
+    assert_eq!(route.user_name.as_deref(), Some("overlay"));
+}

@@ -223,9 +223,41 @@ impl RegistryStore {
         Ok(ServiceRoute {
             node_id: row.try_get("node_id")?,
             tcp_addr: row.try_get("endpoint_addr")?,
-            ice_udp_endpoints: self
-                .endpoints(row.try_get::<String, _>("node_id")?, "ice_udp")
-                .await?,
+            ice_udp_endpoints: self.endpoints(row.try_get("node_id")?, "ice_udp").await?,
+            user_name: row.try_get("user_name")?,
+        })
+    }
+
+    pub async fn resolve_node_service_route(
+        &self,
+        node_id: &str,
+        service_id: &str,
+    ) -> anyhow::Result<ServiceRoute> {
+        let row = sqlx::query(
+            r#"
+            select
+              ns.node_id as node_id,
+              ns.user_name as user_name,
+              ne.addr as endpoint_addr
+            from node_services ns
+            join node_endpoints ne on ne.node_id = ns.node_id
+            where ns.node_id = ?1
+              and ns.id = ?2
+              and ne.kind = 'tcp_proxy'
+              and ne.schema_version = 1
+            order by ne.priority desc, ne.id asc
+            limit 1
+            "#,
+        )
+        .bind(node_id)
+        .bind(service_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(ServiceRoute {
+            node_id: row.try_get("node_id")?,
+            tcp_addr: row.try_get("endpoint_addr")?,
+            ice_udp_endpoints: self.endpoints(node_id.to_string(), "ice_udp").await?,
             user_name: row.try_get("user_name")?,
         })
     }

@@ -40,10 +40,20 @@ pub async fn issue_session_grant(
     request: &SessionOpenRequest,
     settings: &SessionSettings,
 ) -> anyhow::Result<SessionOpenGrant> {
-    let route = settings
-        .registry
-        .resolve_service_route(&request.service_id)
-        .await?;
+    let route = match request.node_id.as_deref() {
+        Some(node_id) => {
+            settings
+                .registry
+                .resolve_node_service_route(node_id, &request.service_id)
+                .await?
+        }
+        None => {
+            settings
+                .registry
+                .resolve_service_route(&request.service_id)
+                .await?
+        }
+    };
     let session_id = format!("sess_{}", uuid::Uuid::new_v4().simple());
     let token = issue_session_token(
         &settings.shared_secret,

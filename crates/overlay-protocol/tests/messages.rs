@@ -10,6 +10,7 @@ fn session_open_request_round_trips_as_json() {
     let req = SessionOpenRequest {
         service_id: "svc_openclaw".into(),
         requester_device_id: "dev_phone".into(),
+        node_id: Some("node-1".into()),
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -17,6 +18,7 @@ fn session_open_request_round_trips_as_json() {
 
     assert_eq!(parsed.service_id, "svc_openclaw");
     assert_eq!(parsed.requester_device_id, "dev_phone");
+    assert_eq!(parsed.node_id.as_deref(), Some("node-1"));
     assert_eq!(ServiceKind::Http.as_str(), "http");
     assert_eq!(ServiceKind::Https.as_str(), "https");
     assert_eq!(EndpointKind::IceUdp.as_str(), "ice_udp");

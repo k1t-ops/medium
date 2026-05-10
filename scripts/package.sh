@@ -4,8 +4,13 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="${1:-$repo_root/dist/package}"
 release_dir="${2:-$repo_root/dist}"
-version="${MEDIUM_VERSION:-0.0.3}"
+version="${MEDIUM_VERSION:-0.0.4}"
 target="${MEDIUM_TARGET:-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)}"
+cargo_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+case "$cargo_target_dir" in
+  /*) ;;
+  *) cargo_target_dir="$repo_root/$cargo_target_dir" ;;
+esac
 
 cd "$repo_root"
 
@@ -26,10 +31,10 @@ mkdir -p \
   "$out_dir/docs/linux" \
   "$out_dir/homebrew"
 
-install -m 0755 target/release/medium "$out_dir/bin/medium"
-install -m 0755 target/release/control-plane "$out_dir/bin/control-plane"
-install -m 0755 target/release/home-node "$out_dir/bin/node-agent"
-install -m 0755 target/release/relay "$out_dir/bin/relay"
+install -m 0755 "$cargo_target_dir/release/medium" "$out_dir/bin/medium"
+install -m 0755 "$cargo_target_dir/release/control-plane" "$out_dir/bin/control-plane"
+install -m 0755 "$cargo_target_dir/release/home-node" "$out_dir/bin/node-agent"
+install -m 0755 "$cargo_target_dir/release/relay" "$out_dir/bin/relay"
 
 install -m 0644 packaging/systemd/medium-control-plane.service \
   "$out_dir/systemd/medium-control-plane.service"

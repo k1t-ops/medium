@@ -5,6 +5,7 @@ members = [
   "crates/overlay-crypto",
   "crates/overlay-transport",
   "crates/medium-netstack",
+  "crates/medium-session",
   "crates/medium-android-netstack",
   "crates/client-core",
   "services/control-plane",
@@ -17,7 +18,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.0.2"
+version = "0.0.4"
 
 [workspace.dependencies]
 anyhow = "1"

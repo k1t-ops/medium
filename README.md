@@ -28,7 +28,7 @@ For a fork or private repo:
 curl -fsSL https://raw.githubusercontent.com/burniq/medium/main/scripts/install.sh | MEDIUM_REPO=burniq/medium sh
 ```
 
-The installer downloads `medium-${MEDIUM_VERSION:-0.0.2}-${target}.tar.gz` from
+The installer downloads `medium-${MEDIUM_VERSION:-0.0.4}-${target}.tar.gz` from
 GitHub Releases. If `medium` is already in `PATH`, the installer updates that
 existing location. Otherwise it installs into `/usr/bin` on Linux and
 `/usr/local/bin` on macOS by default:
@@ -42,7 +42,7 @@ Use a specific release or target when needed:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/burniq/medium/main/scripts/install.sh | \
-  MEDIUM_VERSION=0.0.2 MEDIUM_TARGET=linux-x86_64 sh
+  MEDIUM_VERSION=0.0.4 MEDIUM_TARGET=linux-x86_64 sh
 ```
 
 Use a different install prefix if needed:
@@ -58,7 +58,7 @@ curl -fsSL https://raw.githubusercontent.com/burniq/medium/main/scripts/install.
 ```
 
 Release archives are published automatically by GitHub Actions when a tag like
-`v0.0.2` is pushed. The release workflow uploads:
+`v0.0.4` is pushed. The release workflow uploads:
 
 - `medium-<version>-linux-x86_64.tar.gz`
 - `medium-<version>-linux-aarch64.tar.gz`
@@ -196,9 +196,15 @@ sudo systemctl restart medium-node-agent
 ```
 
 Joined clients can discover published SSH services with `medium devices` and
-generate a regular OpenSSH config with `medium ssh sync`. The control plane is
-used for discovery and session initialization. SSH traffic uses the direct node
-candidate when available and otherwise uses the relay fallback.
+connect with `medium ssh <node>`. Medium generates a fresh ephemeral SSH key for
+each connection, asks the control plane for a short-lived OpenSSH certificate,
+and then opens the SSH session through Medium transport. The control plane is
+used for discovery and session initialization. SSH traffic uses the same Medium
+session transport as published web services: ICE UDP is tried first, legacy
+direct/relay candidates are used as fallback, and the SSH byte stream is
+wrapped in Medium service TLS before it reaches the node. Use
+`medium ssh --relay <node>` to skip direct candidates and force relay transport
+for diagnostics or constrained networks.
 
 ### Test Published Service
 
@@ -239,11 +245,13 @@ Run this on a client machine:
 ```sh
 medium join 'medium://join?v=1&control=https://control.example.com:7777&security=pinned-tls&control_pin=sha256:...'
 medium devices
-medium ssh sync
-ssh workstation-1
+medium services
+medium ssh workstation-1
+medium ssh --relay workstation-1
 ```
 
-`medium ssh sync` writes a Medium-managed SSH include file and keeps the main SSH config limited to a single `Include`.
+`medium ssh <node>` is the primary SSH entrypoint. It does not require copying
+client keys into `authorized_keys`.
 
 ## iOS App
 

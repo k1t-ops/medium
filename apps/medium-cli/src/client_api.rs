@@ -2,7 +2,10 @@ use crate::app;
 use crate::state::AppState;
 use crate::state::invite::Invite;
 use anyhow::{Context, bail};
-use overlay_protocol::{DeviceCatalogResponse, SessionOpenGrant, SessionOpenRequest};
+use overlay_protocol::{
+    DeviceCatalogResponse, SessionOpenGrant, SessionOpenRequest, SshCertificateRequest,
+    SshCertificateResponse,
+};
 use overlay_transport::pinned_http;
 use serde::Deserialize;
 
@@ -38,6 +41,7 @@ pub async fn pair(server_url: &str, device_name: &str) -> anyhow::Result<AppStat
         invite_version: 0,
         security: String::new(),
         control_pin: String::new(),
+        client_secret: String::new(),
     })
 }
 
@@ -51,6 +55,7 @@ pub async fn join(invite: &Invite) -> anyhow::Result<AppState> {
         invite_version: invite.version,
         security: invite.security.clone(),
         control_pin: invite.control_pin.clone(),
+        client_secret: invite.client_secret.clone().unwrap_or_default(),
     })
 }
 
@@ -62,6 +67,42 @@ pub async fn fetch_devices(state: &AppState) -> anyhow::Result<DeviceCatalogResp
 
     let response = reqwest::get(url).await?.error_for_status()?;
     Ok(response.json().await?)
+}
+
+pub async fn fetch_medium_ca(state: &AppState) -> anyhow::Result<String> {
+    let url = format!(
+        "{}/api/medium-ca.pem",
+        state.server_url.trim_end_matches('/')
+    );
+    let bytes = if state.security == "pinned-tls" {
+        pinned_http::get_bytes(&url, &state.control_pin).await?
+    } else {
+        reqwest::get(url)
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec()
+    };
+    let pem = String::from_utf8(bytes).context("Medium service CA response is not UTF-8")?;
+    if !pem.contains("BEGIN CERTIFICATE") {
+        bail!("Medium service CA response is not a PEM certificate");
+    }
+    Ok(pem)
+}
+
+pub async fn fetch_ssh_ca_public_key(
+    control_url: &str,
+    control_pin: &str,
+) -> anyhow::Result<String> {
+    let server_url = normalize_control_url(control_url)?;
+    let url = format!("{}/api/ssh/ca.pub", server_url.trim_end_matches('/'));
+    let bytes = pinned_http::get_bytes(&url, control_pin).await?;
+    let public_key = String::from_utf8(bytes).context("Medium SSH CA response is not UTF-8")?;
+    if !public_key.trim_start().starts_with("ssh-") {
+        bail!("Medium SSH CA response is not an OpenSSH public key");
+    }
+    Ok(public_key)
 }
 
 fn local_device_name() -> String {
@@ -88,16 +129,28 @@ fn normalize_control_url(raw: &str) -> anyhow::Result<String> {
 }
 
 pub async fn open_session(state: &AppState, service_id: &str) -> anyhow::Result<SessionOpenGrant> {
+    open_session_for_node(state, None, service_id).await
+}
+
+pub async fn open_session_for_node(
+    state: &AppState,
+    node_id: Option<&str>,
+    service_id: &str,
+) -> anyhow::Result<SessionOpenGrant> {
     let url = format!(
         "{}/api/sessions/open",
         state.server_url.trim_end_matches('/')
     );
     if state.security == "pinned-tls" {
-        let url = format!(
+        let mut url = format!(
             "{url}?service_id={}&requester_device_id={}",
             percent_encode(service_id),
             percent_encode(&state.device_name)
         );
+        if let Some(node_id) = node_id {
+            url.push_str("&node_id=");
+            url.push_str(&percent_encode(node_id));
+        }
         return pinned_http::get_json(&url, &state.control_pin).await;
     }
 
@@ -106,7 +159,43 @@ pub async fn open_session(state: &AppState, service_id: &str) -> anyhow::Result<
         .query(&SessionOpenRequest {
             service_id: service_id.to_string(),
             requester_device_id: state.device_name.clone(),
+            node_id: node_id.map(str::to_string),
         })
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(response.json().await?)
+}
+
+pub async fn issue_ssh_certificate(
+    state: &AppState,
+    node_id: &str,
+    service_id: &str,
+    public_key: &str,
+) -> anyhow::Result<SshCertificateResponse> {
+    if state.client_secret.trim().is_empty() {
+        bail!(
+            "client state is missing client_secret; re-run `medium join <invite>` with a fresh invite from `medium init-control --reconfigure`"
+        );
+    }
+    let url = format!(
+        "{}/api/ssh/certificate",
+        state.server_url.trim_end_matches('/')
+    );
+    let request = SshCertificateRequest {
+        service_id: service_id.to_string(),
+        node_id: Some(node_id.to_string()),
+        requester_device_id: state.device_name.clone(),
+        public_key: public_key.to_string(),
+        client_secret: state.client_secret.clone(),
+    };
+    if state.security == "pinned-tls" {
+        return pinned_http::post_json(&url, &state.control_pin, &request).await;
+    }
+
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&request)
         .send()
         .await?
         .error_for_status()?;

@@ -56,6 +56,8 @@ impl CandidateKind {
 pub struct SessionOpenRequest {
     pub service_id: String,
     pub requester_device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,23 @@ pub struct ServiceCertificateRequest {
 pub struct ServiceCertificateResponse {
     pub cert_pem: String,
     pub key_pem: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshCertificateRequest {
+    pub service_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    pub requester_device_id: String,
+    pub public_key: String,
+    pub client_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshCertificateResponse {
+    pub certificate: String,
+    pub user_name: String,
+    pub valid_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

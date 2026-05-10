@@ -2,7 +2,7 @@
 set -eu
 
 repo="${MEDIUM_REPO:-burniq/medium}"
-version="${MEDIUM_VERSION:-0.0.3}"
+version="${MEDIUM_VERSION:-0.0.4}"
 release_tag="${MEDIUM_RELEASE_TAG:-v$version}"
 
 need() {
@@ -123,6 +123,12 @@ if [ "${MEDIUM_INSTALL_FROM_SOURCE:-}" = "1" ]; then
     exit 1
   fi
 
+  cargo_target_dir="${CARGO_TARGET_DIR:-$src_dir/target}"
+  case "$cargo_target_dir" in
+    /*) ;;
+    *) cargo_target_dir="$src_dir/$cargo_target_dir" ;;
+  esac
+
   echo "medium installer: building release binaries"
   (
     cd "$src_dir"
@@ -133,9 +139,9 @@ if [ "${MEDIUM_INSTALL_FROM_SOURCE:-}" = "1" ]; then
 
   echo "medium installer: installing into $prefix/bin"
   for bin in medium control-plane relay; do
-    $sudo_cmd install -m 0755 "$src_dir/target/release/$bin" "$prefix/bin/$bin"
+    $sudo_cmd install -m 0755 "$cargo_target_dir/release/$bin" "$prefix/bin/$bin"
   done
-  $sudo_cmd install -m 0755 "$src_dir/target/release/home-node" "$prefix/bin/node-agent"
+  $sudo_cmd install -m 0755 "$cargo_target_dir/release/home-node" "$prefix/bin/node-agent"
 
   echo "medium installer: installed medium"
   echo "next server step: sudo medium init-control"

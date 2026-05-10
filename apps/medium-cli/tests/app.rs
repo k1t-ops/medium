@@ -5,6 +5,8 @@ use medium_cli::{run, run_main};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -50,8 +52,115 @@ fn help_command_returns_grouped_cli_help() -> anyhow::Result<()> {
     assert!(output.contains("  medium control devices"));
     assert!(output.contains("Client:"));
     assert!(output.contains("  medium devices"));
+    assert!(output.contains("  medium services"));
+    assert!(output.contains("  medium ssh [-v|--verbose] [--relay] <device>"));
+    assert!(output.contains("  medium node restart"));
+    assert!(!output.contains("medium ssh sync"));
     assert!(output.contains("Run `medium help <command>` is not supported yet."));
     assert!(!output.contains("usage: medium ["));
+    Ok(())
+}
+
+#[test]
+fn ssh_device_command_is_runtime_command() {
+    let error = run(vec![
+        "medium".to_string(),
+        "ssh".to_string(),
+        "studio-smiley".to_string(),
+    ])
+    .unwrap_err();
+
+    assert!(error.contains("command requires runtime context"));
+}
+
+#[test]
+fn ssh_verbose_device_command_is_runtime_command() {
+    let error = run(vec![
+        "medium".to_string(),
+        "ssh".to_string(),
+        "-v".to_string(),
+        "studio-smiley".to_string(),
+    ])
+    .unwrap_err();
+
+    assert!(error.contains("command requires runtime context"));
+}
+
+#[test]
+fn ssh_relay_device_command_is_runtime_command() {
+    let error = run(vec![
+        "medium".to_string(),
+        "ssh".to_string(),
+        "--relay".to_string(),
+        "studio-smiley".to_string(),
+    ])
+    .unwrap_err();
+
+    assert!(error.contains("command requires runtime context"));
+}
+
+#[test]
+fn proxy_service_command_is_runtime_command() {
+    let error = run(vec![
+        "medium".to_string(),
+        "proxy".to_string(),
+        "service".to_string(),
+        "--node".to_string(),
+        "studio-smiley".to_string(),
+        "--service".to_string(),
+        "hello".to_string(),
+    ])
+    .unwrap_err();
+
+    assert!(error.contains("command requires runtime context"));
+}
+
+#[test]
+fn ssh_sync_command_is_removed() {
+    let error = run(vec![
+        "medium".to_string(),
+        "ssh".to_string(),
+        "sync".to_string(),
+    ])
+    .unwrap_err();
+
+    assert!(error.contains("medium ssh sync was removed"));
+}
+
+#[tokio::test]
+async fn services_command_lists_published_services_from_joined_client() -> anyhow::Result<()> {
+    let _guard = env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let server = TestControlServer::start(
+        r#"{"devices":[{"id":"node-1","name":"office-server","ssh":{"service_id":"svc_ssh","host":"office-server","port":22,"user":"overlay"},"services":[{"id":"hello","kind":"http","schema_version":1,"label":null,"target":"127.0.0.1:8082","user_name":null},{"id":"openclaw","kind":"https","schema_version":1,"label":"OpenClaw","target":"127.0.0.1:3000","user_name":null},{"id":"svc_ssh","kind":"ssh","schema_version":1,"label":null,"target":"127.0.0.1:22","user_name":"overlay"}]}]}"#,
+    )
+    .await;
+    let home = tempfile::tempdir()?;
+    let _home = EnvGuard::set_path("MEDIUM_HOME", home.path());
+    let paths = AppPaths::from_home(home.path());
+    AppState {
+        server_url: server.url,
+        device_name: "client".to_string(),
+        bootstrap_code: String::new(),
+        invite_version: 1,
+        security: String::new(),
+        control_pin: String::new(),
+        client_secret: String::new(),
+    }
+    .save(&paths)?;
+
+    let output = run_main(vec!["medium".to_string(), "services".to_string()])
+        .await
+        .map_err(anyhow::Error::msg)?
+        .expect("services should return output");
+
+    assert!(output.contains("office-server (node-1)"));
+    assert!(output.contains("hello http https://hello.medium/ -> 127.0.0.1:8082"));
+    assert!(
+        output.contains("openclaw https \"OpenClaw\" https://openclaw.medium/ -> 127.0.0.1:3000")
+    );
+    assert!(output.contains("svc_ssh ssh ssh://overlay@office-server -> 127.0.0.1:22"));
     Ok(())
 }
 
@@ -210,6 +319,7 @@ fn app_state_saves_under_state_directory() -> anyhow::Result<()> {
         invite_version: 0,
         security: String::new(),
         control_pin: String::new(),
+        client_secret: String::new(),
     };
 
     state.save(&paths)?;
@@ -236,6 +346,7 @@ fn app_state_loads_legacy_overlay_state_and_migrates_it() -> anyhow::Result<()> 
         invite_version: 0,
         security: String::new(),
         control_pin: String::new(),
+        client_secret: String::new(),
     };
 
     fs::create_dir_all(legacy_state_path.parent().unwrap())?;
@@ -270,6 +381,46 @@ fn write_config(contents: &str) -> anyhow::Result<std::path::PathBuf> {
 struct EnvGuard {
     key: &'static str,
     previous: Option<String>,
+}
+
+struct TestControlServer {
+    url: String,
+}
+
+impl TestControlServer {
+    async fn start(devices_body: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let Ok(n) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..n]);
+                    if !request.starts_with("GET /api/devices ") {
+                        return;
+                    }
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        devices_body.len(),
+                        devices_body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Self {
+            url: format!("http://{addr}"),
+        }
+    }
 }
 
 impl EnvGuard {

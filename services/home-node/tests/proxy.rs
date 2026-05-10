@@ -13,7 +13,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
-async fn proxy_forwards_tcp_stream_to_matching_service() {
+async fn proxy_forwards_plain_tcp_stream_to_matching_non_wrapped_service() {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_addr = target_listener.local_addr().unwrap();
 
@@ -28,8 +28,8 @@ node_id = "node-1"
 bind_addr = "127.0.0.1:0"
 
 [[services]]
-id = "svc_ssh"
-kind = "ssh"
+id = "svc_raw"
+kind = "https"
 target = "{target_addr}"
 "#
     ))
@@ -47,8 +47,8 @@ target = "{target_addr}"
     let bound_addr = bound_addr_rx.await.unwrap();
     let mut client = TcpStream::connect(bound_addr).await.unwrap();
     let hello = SessionHello {
-        token: issue_session_token("local-secret", "sess-1", "svc_ssh", "node-1").unwrap(),
-        service_id: "svc_ssh".into(),
+        token: issue_session_token("local-secret", "sess-1", "svc_raw", "node-1").unwrap(),
+        service_id: "svc_raw".into(),
         transport: None,
     };
     write_session_hello(&mut client, &hello).await.unwrap();
@@ -189,6 +189,86 @@ target = "{target_addr}"
     let mut response = Vec::new();
     tls.read_to_end(&mut response).await?;
     assert!(String::from_utf8_lossy(&response).contains("hello"));
+
+    let _ = shutdown_tx.send(());
+    proxy_task.await?;
+    target_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_terminates_tls_for_ssh_service_and_forwards_raw_ssh() -> anyhow::Result<()> {
+    let ca = issue_medium_service_ca()?;
+    let target_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = target_listener.local_addr()?;
+
+    let target_task = tokio::spawn(async move {
+        let (stream, _) = target_listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut client_banner = String::new();
+        reader.read_line(&mut client_banner).await.unwrap();
+        assert_eq!(client_banner, "SSH-2.0-MediumClient\r\n");
+        reader
+            .get_mut()
+            .write_all(b"SSH-2.0-MediumTarget\r\n")
+            .await
+            .unwrap();
+    });
+
+    let cfg: NodeConfig = toml::from_str(&format!(
+        r#"
+node_id = "node-1"
+bind_addr = "127.0.0.1:0"
+service_ca_cert_pem = """
+{cert}
+"""
+service_ca_key_pem = """
+{key}
+"""
+
+[[services]]
+id = "svc_ssh"
+kind = "ssh"
+target = "{target_addr}"
+"#,
+        cert = ca.cert_pem,
+        key = ca.key_pem,
+    ))?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (bound_addr_tx, bound_addr_rx) = oneshot::channel();
+
+    let proxy_task = tokio::spawn(async move {
+        run_tcp_proxy_with_shutdown(cfg, "local-secret", shutdown_rx, Some(bound_addr_tx))
+            .await
+            .unwrap();
+    });
+
+    let bound_addr = bound_addr_rx.await?;
+    let mut stream = TcpStream::connect(bound_addr).await?;
+    let hello = SessionHello {
+        token: issue_session_token("local-secret", "sess-ssh", "svc_ssh", "node-1")?,
+        service_id: "svc_ssh".into(),
+        transport: None,
+    };
+    write_session_hello(&mut stream, &hello).await?;
+
+    let connector = TlsConnector::from(Arc::new(client_tls_config(&ca.cert_pem)?));
+    let server_name = ServerName::try_from("svc-ssh.medium")?;
+    let mut tls = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connector.connect(server_name, stream),
+    )
+    .await??;
+    tls.write_all(b"SSH-2.0-MediumClient\r\n").await?;
+    let mut banner = Vec::new();
+    let mut reader = BufReader::new(tls);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        reader.read_until(b'\n', &mut banner),
+    )
+    .await??;
+    assert_eq!(banner, b"SSH-2.0-MediumTarget\r\n");
 
     let _ = shutdown_tx.send(());
     proxy_task.await?;

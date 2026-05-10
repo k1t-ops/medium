@@ -28,6 +28,7 @@ async fn bootstrap_route_returns_medium_join_invite() {
             .await
             .unwrap(),
         shared_secret: "local-test-secret".into(),
+        client_secret: "client-secret".into(),
         control_pin: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .into(),
         service_ca_cert_pem: None,
@@ -35,6 +36,7 @@ async fn bootstrap_route_returns_medium_join_invite() {
         relay_addr: None,
         wss_relay_url: None,
         ice_relay_addr: None,
+        ssh_ca_key_path: None,
     });
     let response = app
         .oneshot(
@@ -65,7 +67,7 @@ async fn bootstrap_route_returns_medium_join_invite() {
     assert_eq!(
         payload.invite,
         format!(
-            "medium://join?v=1&control=https://control.example.test&security=pinned-tls&control_pin={}",
+            "medium://join?v=1&control=https://control.example.test&security=pinned-tls&control_pin={}&client_secret=client-secret",
             payload.control_pin
         )
     );
@@ -79,6 +81,7 @@ async fn bootstrap_route_ignores_invalid_forwarded_headers() {
             .await
             .unwrap(),
         shared_secret: "local-test-secret".into(),
+        client_secret: "client-secret".into(),
         control_pin: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             .into(),
         service_ca_cert_pem: None,
@@ -86,6 +89,7 @@ async fn bootstrap_route_ignores_invalid_forwarded_headers() {
         relay_addr: None,
         wss_relay_url: None,
         ice_relay_addr: None,
+        ssh_ca_key_path: None,
     });
     let response = app
         .oneshot(
@@ -107,7 +111,7 @@ async fn bootstrap_route_ignores_invalid_forwarded_headers() {
     assert_eq!(
         payload.invite,
         format!(
-            "medium://join?v=1&control=http://127.0.0.1:8080&security=pinned-tls&control_pin={}",
+            "medium://join?v=1&control=http://127.0.0.1:8080&security=pinned-tls&control_pin={}&client_secret=client-secret",
             payload.control_pin
         )
     );
@@ -121,12 +125,14 @@ async fn service_certificate_route_issues_leaf_from_medium_ca() {
             .await
             .unwrap(),
         shared_secret: "local-test-secret".into(),
+        client_secret: "client-secret".into(),
         control_pin: String::new(),
         service_ca_cert_pem: Some(ca.cert_pem),
         service_ca_key_pem: Some(ca.key_pem),
         relay_addr: None,
         wss_relay_url: None,
         ice_relay_addr: None,
+        ssh_ca_key_path: None,
     });
     let body = serde_json::to_vec(&ServiceCertificateRequest {
         node_id: "node-1".into(),

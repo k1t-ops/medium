@@ -2,7 +2,6 @@ pub mod app;
 pub mod cli;
 pub mod client_api;
 pub mod paths;
-pub mod ssh;
 pub mod state;
 
 pub fn run<I>(args: I) -> Result<String, String>

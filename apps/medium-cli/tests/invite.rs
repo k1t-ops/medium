@@ -11,6 +11,7 @@ fn parses_versioned_join_invite() {
     assert_eq!(invite.control_url, "http://127.0.0.1:7777");
     assert_eq!(invite.security, "pinned-tls");
     assert_eq!(invite.control_pin, "sha256:abc123");
+    assert_eq!(invite.client_secret, None);
 }
 
 #[test]
@@ -61,6 +62,7 @@ async fn join_rejects_malformed_control_url() {
         control_url: "not-a-url".to_string(),
         security: "pinned-tls".to_string(),
         control_pin: "sha256:abc123".to_string(),
+        client_secret: None,
     };
 
     assert!(client_api::join(&invite).await.is_err());

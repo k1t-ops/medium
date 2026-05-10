@@ -19,6 +19,7 @@ const NODE_AGENT_UNIT_TEMPLATE: &str =
 const RELAY_UNIT_TEMPLATE: &str = include_str!("../../../packaging/systemd/medium-relay.service");
 const RELAY_SERVICE: &str = "medium-relay.service";
 const CONTROL_SERVICE: &str = "medium-control-plane.service";
+const NODE_SERVICE: &str = "medium-node-agent.service";
 
 #[allow(dead_code)]
 pub struct InitControlReport {
@@ -42,8 +43,12 @@ struct InstallLayout {
     control_key_path: PathBuf,
     service_ca_cert_path: PathBuf,
     service_ca_key_path: PathBuf,
+    ssh_ca_key_path: PathBuf,
+    ssh_ca_public_key_path: PathBuf,
     node_config_path: PathBuf,
     node_services_path: PathBuf,
+    node_ssh_ca_public_key_path: PathBuf,
+    sshd_config_path: PathBuf,
     database_path: PathBuf,
     control_unit_path: PathBuf,
     node_unit_path: PathBuf,
@@ -61,8 +66,16 @@ impl InstallLayout {
             control_key_path: config_dir.join("control.key"),
             service_ca_cert_path: config_dir.join("service-ca.crt"),
             service_ca_key_path: config_dir.join("service-ca.key"),
+            ssh_ca_key_path: config_dir.join("ssh-ca"),
+            ssh_ca_public_key_path: config_dir.join("ssh-ca.pub"),
             node_config_path: node_config_dir.join("node.toml"),
             node_services_path: node_config_dir.join("services.toml"),
+            node_ssh_ca_public_key_path: config_dir.join("ssh-ca.pub"),
+            sshd_config_path: root
+                .join("etc")
+                .join("ssh")
+                .join("sshd_config.d")
+                .join("99-medium.conf"),
             database_path: state_dir.join("control-plane.db"),
             control_unit_path: systemd_unit_dir.join("medium-control-plane.service"),
             node_unit_path: systemd_unit_dir.join("medium-node-agent.service"),
@@ -202,10 +215,12 @@ fn init_control_at(
     write_private_file(&layout.control_key_path, &tls_identity.key_pem)?;
     write_text_file(&layout.service_ca_cert_path, &service_ca.cert_pem)?;
     write_private_file(&layout.service_ca_key_path, &service_ca.key_pem)?;
+    ensure_ssh_ca_identity(&layout.ssh_ca_key_path)?;
 
     let shared_secret = make_token("medium-shared-secret");
+    let client_secret = make_token("medium-client-secret");
     let control_pin = tls_identity.control_pin;
-    let invite = client_api::format_join_invite(control_url, &control_pin)?;
+    let invite = format_join_invite(control_url, &control_pin, &client_secret)?;
     let node_invite = format_node_invite(
         control_url,
         &control_pin,
@@ -223,7 +238,10 @@ fn init_control_at(
         &layout.control_key_path,
         &layout.service_ca_cert_path,
         &layout.service_ca_key_path,
+        &layout.ssh_ca_key_path,
+        &layout.ssh_ca_public_key_path,
         &shared_secret,
+        &client_secret,
         &control_pin,
         relay_addr,
         wss_relay_url,
@@ -235,6 +253,7 @@ fn init_control_at(
             root,
             bind_addr,
             &shared_secret,
+            &client_secret,
             &control_pin,
             relay_addr,
             wss_relay_url,
@@ -251,7 +270,8 @@ fn init_control_at(
         root,
         &["medium-relay.service", "medium-control-plane.service"],
         reconfigure,
-    )?;
+    )
+    .context("systemd setup failed")?;
 
     Ok(InitControlReport {
         control_config_path: layout.control_config_path,
@@ -261,14 +281,14 @@ fn init_control_at(
     })
 }
 
-pub fn init_node(invite: &str, reconfigure: bool) -> anyhow::Result<InitNodeReport> {
+pub async fn init_node(invite: &str, reconfigure: bool) -> anyhow::Result<InitNodeReport> {
     let root = install_root();
     let profile = parse_node_invite(invite)?;
     let node_addrs = node_addrs()?;
-    init_node_at(&root, &profile, &node_addrs, reconfigure)
+    init_node_at(&root, &profile, &node_addrs, reconfigure).await
 }
 
-fn init_node_at(
+async fn init_node_at(
     root: &Path,
     profile: &NodeInvite,
     node_addrs: &NodeAddrs,
@@ -302,6 +322,15 @@ fn init_node_at(
     )?;
     write_default_services_config(&layout.node_services_path)?;
     if writes_systemd_units(root) {
+        let ssh_ca_public_key = resolve_node_ssh_ca_public_key(profile).await?;
+        write_node_ssh_ca_config(
+            &layout.node_ssh_ca_public_key_path,
+            &layout.sshd_config_path,
+            &ssh_ca_public_key,
+        )?;
+        maybe_reload_sshd(root)?;
+    }
+    if writes_systemd_units(root) {
         write_node_systemd_unit(
             &layout,
             root,
@@ -312,11 +341,30 @@ fn init_node_at(
             profile.wss_relay_url.as_deref().unwrap_or(""),
         )?;
     }
-    maybe_enable_systemd_services(root, &["medium-node-agent.service"], reconfigure)?;
+    maybe_enable_systemd_services(root, &["medium-node-agent.service"], reconfigure)
+        .context("systemd setup failed")?;
 
     Ok(InitNodeReport {
         node_config_path: layout.node_config_path,
     })
+}
+
+async fn resolve_node_ssh_ca_public_key(profile: &NodeInvite) -> anyhow::Result<String> {
+    if let Some(ssh_ca_public_key) = profile
+        .ssh_ca_public_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(ssh_ca_public_key.to_string());
+    }
+    client_api::fetch_ssh_ca_public_key(&profile.control_url, &profile.control_pin)
+        .await
+        .with_context(|| {
+            format!(
+                "fetch Medium SSH CA public key from {}/api/ssh/ca.pub",
+                profile.control_url.trim_end_matches('/')
+            )
+        })
 }
 
 pub(crate) fn install_root() -> PathBuf {
@@ -431,7 +479,10 @@ fn write_control_config(
     tls_key_path: &Path,
     service_ca_cert_path: &Path,
     service_ca_key_path: &Path,
+    ssh_ca_key_path: &Path,
+    ssh_ca_public_key_path: &Path,
     shared_secret: &str,
+    client_secret: &str,
     control_pin: &str,
     relay_addr: &str,
     wss_relay_url: &str,
@@ -442,12 +493,14 @@ fn write_control_config(
         format!("wss_relay_url = \"{wss_relay_url}\"\n")
     };
     let contents = format!(
-        "# Generated by medium init-control\nbind_addr = \"{bind_addr}\"\ndatabase_url = \"sqlite://{}\"\ncontrol_url = \"{control_url}\"\ntls_cert_path = \"{}\"\ntls_key_path = \"{}\"\nservice_ca_cert_path = \"{}\"\nservice_ca_key_path = \"{}\"\nshared_secret = \"{shared_secret}\"\ncontrol_pin = \"{control_pin}\"\nrelay_addr = \"{relay_addr}\"\n{wss_relay_line}",
+        "# Generated by medium init-control\nbind_addr = \"{bind_addr}\"\ndatabase_url = \"sqlite://{}\"\ncontrol_url = \"{control_url}\"\ntls_cert_path = \"{}\"\ntls_key_path = \"{}\"\nservice_ca_cert_path = \"{}\"\nservice_ca_key_path = \"{}\"\nssh_ca_key_path = \"{}\"\nssh_ca_public_key_path = \"{}\"\nshared_secret = \"{shared_secret}\"\nclient_secret = \"{client_secret}\"\ncontrol_pin = \"{control_pin}\"\nrelay_addr = \"{relay_addr}\"\n{wss_relay_line}",
         database_path.display(),
         tls_cert_path.display(),
         tls_key_path.display(),
         service_ca_cert_path.display(),
-        service_ca_key_path.display()
+        service_ca_key_path.display(),
+        ssh_ca_key_path.display(),
+        ssh_ca_public_key_path.display()
     );
     fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
@@ -498,11 +551,33 @@ fn write_default_services_config(path: &Path) -> anyhow::Result<()> {
     fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
+fn write_node_ssh_ca_config(
+    ca_public_key_path: &Path,
+    sshd_config_path: &Path,
+    ca_public_key: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = ca_public_key_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    write_text_file(ca_public_key_path, ca_public_key)?;
+    if let Some(parent) = sshd_config_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    write_text_file(
+        sshd_config_path,
+        &format!(
+            "# Generated by medium init-node\nTrustedUserCAKeys {}\n",
+            ca_public_key_path.display()
+        ),
+    )
+}
+
 fn write_control_systemd_unit(
     layout: &InstallLayout,
     root: &Path,
     bind_addr: &str,
     shared_secret: &str,
+    client_secret: &str,
     control_pin: &str,
     relay_addr: &str,
     wss_relay_url: &str,
@@ -516,6 +591,7 @@ fn write_control_systemd_unit(
             layout,
             bind_addr,
             shared_secret,
+            client_secret,
             control_pin,
             relay_addr,
             wss_relay_url,
@@ -557,6 +633,7 @@ fn render_control_plane_unit(
     layout: &InstallLayout,
     bind_addr: &str,
     shared_secret: &str,
+    client_secret: &str,
     control_pin: &str,
     relay_addr: &str,
     wss_relay_url: &str,
@@ -579,6 +656,7 @@ fn render_control_plane_unit(
                 &format!("sqlite://{}", layout.database_path.display()),
             ),
             ("{{SHARED_SECRET}}", shared_secret),
+            ("{{CLIENT_SECRET}}", client_secret),
             ("{{CONTROL_PIN}}", control_pin),
             (
                 "{{SERVICE_CA_CERT_PATH}}",
@@ -587,6 +665,10 @@ fn render_control_plane_unit(
             (
                 "{{SERVICE_CA_KEY_PATH}}",
                 &layout.service_ca_key_path.display().to_string(),
+            ),
+            (
+                "{{SSH_CA_KEY_PATH}}",
+                &layout.ssh_ca_key_path.display().to_string(),
             ),
             ("{{RELAY_ADDR}}", relay_addr),
             ("{{WSS_RELAY_ENV}}", &wss_relay_env),
@@ -730,14 +812,45 @@ fn maybe_enable_systemd_services(
     }
 
     let systemctl = systemctl_bin();
-    run_command(&systemctl, &["daemon-reload"])?;
+    run_command(&systemctl, &["daemon-reload"]).context("systemd daemon-reload failed")?;
     for service in services {
-        run_command(&systemctl, &["enable", "--now", service])?;
+        run_command(&systemctl, &["enable", "--now", service])
+            .with_context(|| format!("systemd enable/start failed for {service}"))?;
         if restart {
-            run_command(&systemctl, &["restart", service])?;
+            run_command(&systemctl, &["restart", service])
+                .with_context(|| format!("systemd restart failed for {service}"))?;
         }
     }
     Ok(())
+}
+
+fn maybe_reload_sshd(root: &Path) -> anyhow::Result<()> {
+    if !uses_systemd(root) {
+        return Ok(());
+    }
+
+    let systemctl = systemctl_bin();
+    let ssh = Command::new(&systemctl)
+        .args(["reload", "ssh.service"])
+        .output()
+        .with_context(|| "run systemctl reload ssh.service")?;
+    if ssh.status.success() {
+        return Ok(());
+    }
+
+    let sshd = Command::new(&systemctl)
+        .args(["reload", "sshd.service"])
+        .output()
+        .with_context(|| "run systemctl reload sshd.service")?;
+    if sshd.status.success() {
+        return Ok(());
+    }
+
+    bail!(
+        "failed to reload SSH daemon after installing Medium SSH CA; tried ssh.service ({}) and sshd.service ({})",
+        String::from_utf8_lossy(&ssh.stderr).trim(),
+        String::from_utf8_lossy(&sshd.stderr).trim()
+    );
 }
 
 fn uses_systemd(root: &Path) -> bool {
@@ -786,9 +899,22 @@ pub fn restart_control_services() -> anyhow::Result<Vec<&'static str>> {
     let systemctl = systemctl_bin();
     let services = vec![RELAY_SERVICE, CONTROL_SERVICE];
     for service in &services {
-        run_command(&systemctl, &["restart", service])?;
+        run_command(&systemctl, &["restart", service])
+            .with_context(|| format!("systemd restart failed for {service}"))?;
     }
     Ok(services)
+}
+
+pub fn restart_node_service() -> anyhow::Result<&'static str> {
+    let root = install_root();
+    if !uses_systemd(&root) {
+        bail!("node restart requires systemd");
+    }
+
+    let systemctl = systemctl_bin();
+    run_command(&systemctl, &["restart", NODE_SERVICE])
+        .with_context(|| format!("systemd restart failed for {NODE_SERVICE}"))?;
+    Ok(NODE_SERVICE)
 }
 
 pub(crate) fn systemctl_bin() -> String {
@@ -804,17 +930,21 @@ fn run_command(command: &str, args: &[&str]) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        bail!(
-            "command failed: {} {} (status {})",
-            command,
-            args.join(" "),
-            output.status
-        );
+    let mut message = format!(
+        "command failed: {} {} (status {})",
+        command,
+        args.join(" "),
+        output.status
+    );
+    if !stderr.is_empty() {
+        message.push_str(&format!("\nstderr:\n{stderr}"));
     }
-
-    bail!("command failed: {} {}: {}", command, args.join(" "), stderr);
+    if !stdout.is_empty() {
+        message.push_str(&format!("\nstdout:\n{stdout}"));
+    }
+    bail!(message);
 }
 
 fn touch_file(path: &Path) -> anyhow::Result<()> {
@@ -888,6 +1018,21 @@ fn is_unsuitable_certificate_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::")
 }
 
+fn format_join_invite(
+    control_url: &str,
+    control_pin: &str,
+    client_secret: &str,
+) -> anyhow::Result<String> {
+    let base = client_api::format_join_invite(control_url, control_pin)?;
+    if client_secret.is_empty() {
+        bail!("client secret cannot be empty");
+    }
+    Ok(format!(
+        "{base}&client_secret={}",
+        url_query_value(client_secret)
+    ))
+}
+
 #[derive(Debug, Clone)]
 struct NodeInvite {
     control_url: String,
@@ -897,6 +1042,7 @@ struct NodeInvite {
     wss_relay_url: Option<String>,
     service_ca_cert_pem: Option<String>,
     service_ca_key_pem: Option<String>,
+    ssh_ca_public_key: Option<String>,
 }
 
 fn format_node_invite(
@@ -954,6 +1100,7 @@ fn parse_node_invite(raw: &str) -> anyhow::Result<NodeInvite> {
     let mut wss_relay_url = None;
     let mut service_ca_cert_pem = None;
     let mut service_ca_key_pem = None;
+    let mut ssh_ca_public_key = None;
 
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
@@ -966,6 +1113,7 @@ fn parse_node_invite(raw: &str) -> anyhow::Result<NodeInvite> {
             "wss_relay" => wss_relay_url = Some(value.to_string()),
             "service_ca_cert" => service_ca_cert_pem = Some(value.to_string()),
             "service_ca_key" => service_ca_key_pem = Some(value.to_string()),
+            "ssh_ca_public_key" => ssh_ca_public_key = Some(value.to_string()),
             _ => {}
         }
     }
@@ -997,6 +1145,7 @@ fn parse_node_invite(raw: &str) -> anyhow::Result<NodeInvite> {
         wss_relay_url,
         service_ca_cert_pem,
         service_ca_key_pem,
+        ssh_ca_public_key,
     })
 }
 
@@ -1015,6 +1164,36 @@ fn write_private_file(path: &Path, contents: &str) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_ssh_ca_identity(key_path: &Path) -> anyhow::Result<()> {
+    let public_key_path = key_path.with_extension("pub");
+    if key_path.is_file() && public_key_path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let output = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "medium-ssh-ca",
+            "-f",
+            &key_path.display().to_string(),
+        ])
+        .output()
+        .with_context(|| "run ssh-keygen to generate Medium SSH CA")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("ssh-keygen failed to generate Medium SSH CA: {stderr}");
     }
     Ok(())
 }

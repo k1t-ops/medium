@@ -50,6 +50,7 @@ async fn session_grant_contains_signed_token_and_candidate() {
         &SessionOpenRequest {
             service_id: "svc_ssh".into(),
             requester_device_id: "macbook".into(),
+            node_id: None,
         },
         &settings,
     )
@@ -109,6 +110,7 @@ async fn session_grant_includes_relay_candidate_when_configured() {
         &SessionOpenRequest {
             service_id: "svc_ssh".into(),
             requester_device_id: "macbook".into(),
+            node_id: None,
         },
         &settings,
     )
@@ -176,6 +178,7 @@ async fn session_grant_includes_wss_relay_candidate_when_configured() {
         &SessionOpenRequest {
             service_id: "svc_ssh".into(),
             requester_device_id: "macbook".into(),
+            node_id: None,
         },
         &settings,
     )
@@ -247,6 +250,7 @@ async fn session_grant_includes_optional_ice_relay_section_when_configured() {
         &SessionOpenRequest {
             service_id: "svc_web".into(),
             requester_device_id: "android".into(),
+            node_id: None,
         },
         &settings,
     )
@@ -319,6 +323,7 @@ async fn session_grant_preserves_all_registered_ice_udp_endpoints() {
         &SessionOpenRequest {
             service_id: "svc_web".into(),
             requester_device_id: "android".into(),
+            node_id: None,
         },
         &settings,
     )
@@ -346,5 +351,62 @@ async fn session_grant_preserves_all_registered_ice_udp_endpoints() {
             (IceCandidateKind::Srflx, "198.51.100.20", 17002, 100),
             (IceCandidateKind::Relay, "127.0.0.1", 7001, 10),
         ]
+    );
+}
+
+#[tokio::test]
+async fn session_grant_can_target_node_scoped_service_id() {
+    let store = control_plane::registry::RegistryStore::in_memory()
+        .await
+        .unwrap();
+    for (node_id, addr) in [
+        ("node-1", "127.0.0.1:17001"),
+        ("studio-smiley", "192.168.1.126:17001"),
+    ] {
+        store
+            .register_node(&RegisterNodeRequest {
+                node_id: node_id.into(),
+                node_label: node_id.into(),
+                endpoints: vec![NodeEndpoint {
+                    kind: EndpointKind::TcpProxy,
+                    schema_version: 1,
+                    addr: addr.into(),
+                    priority: 10,
+                }],
+                services: vec![PublishedService {
+                    id: "svc_ssh".into(),
+                    kind: ServiceKind::Ssh,
+                    schema_version: 1,
+                    label: None,
+                    target: "127.0.0.1:22".into(),
+                    user_name: Some("overlay".into()),
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    let settings = control_plane::routes::sessions::SessionSettings {
+        registry: store,
+        shared_secret: "local-secret".into(),
+        relay_addr: None,
+        wss_relay_url: None,
+        ice_relay_addr: None,
+    };
+    let grant = control_plane::routes::sessions::issue_session_grant(
+        &SessionOpenRequest {
+            service_id: "svc_ssh".into(),
+            requester_device_id: "macbook".into(),
+            node_id: Some("studio-smiley".into()),
+        },
+        &settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(grant.node_id, "studio-smiley");
+    assert_eq!(
+        grant.authorization.candidates[0].addr,
+        "192.168.1.126:17001"
     );
 }

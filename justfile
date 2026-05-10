@@ -3,8 +3,14 @@ set shell := ["bash", "-cu"]
 rust-test:
   cargo test --workspace
 
+rust-test-cached:
+  source scripts/cache-env.sh && cargo test --workspace
+
 android-test:
   cd apps/android && gradle test
+
+disk-usage:
+  bash scripts/disk-usage.sh
 
 smoke:
   bash tests/e2e/smoke.sh
@@ -34,11 +40,11 @@ e2e-release-workflow:
   grep -Fq 'needs: package' .github/workflows/release.yml
   grep -Fq 'softprops/action-gh-release@v3' .github/workflows/release.yml
 
-e2e-macos-ssh:
-  bash tests/e2e/macos_ssh_sync.sh
-
 e2e-init-control-join:
   bash tests/e2e/init_control_join.sh
 
 e2e-wss-relay:
   bash tests/e2e/wss_relay.sh
+
+netlab-relay-ssh:
+  bash tests/netlab/run.sh

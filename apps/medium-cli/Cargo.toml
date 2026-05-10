@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 client-core = { path = "../../crates/client-core" }
 home-node = { path = "../../services/home-node" }
+medium-session = { path = "../../crates/medium-session" }
 overlay-crypto = { path = "../../crates/overlay-crypto" }
 overlay-protocol = { path = "../../crates/overlay-protocol" }
 overlay-transport = { path = "../../crates/overlay-transport" }
